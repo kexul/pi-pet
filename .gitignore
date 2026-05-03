@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+vid/
+*.mp4
+*.kra
+*autosave*
+.python-version
+.venv/
