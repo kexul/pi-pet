@@ -25,7 +25,7 @@ STALE_TTL = 60.0  # seconds before a status file is considered stale
 PID_CHECK_INTERVAL = 5.0  # seconds between PID liveness checks
 POSITION_FILE = Path(os.environ.get("TEMP", "/tmp")) / "pi-pet-position.json"
 POLL_INTERVAL_MS = 100         # status file poll (milliseconds)
-ANIM_FPS = 8                   # animation frame rate
+ANIM_FPS = 24                  # animation frame rate (matches source video)
 WIN_SIZE = 128                 # floating window size (pixels)
 COLOR_KEY = "#FF00FF"          # magenta = transparent
 
@@ -199,12 +199,11 @@ FRAMES = {
 # When switching idle→run from stretched zone (frame < IDLE_CURLED_START),
 # fast-forward to curled zone first for a smoother transition.
 IDLE_CURLED_START = 38   # first frame where cat is fully curled
-IDLE_FAST_SPEED = 3       # frames per tick during fast-forward
+IDLE_FAST_SPEED = 5       # frames per tick during fast-forward
 
 # Run animation: 0-7 settle (curl→run), 8-27 loop (running cycles)
 RUN_LOOP_START = 8        # first loop frame
 RUN_LOOP_END = 28         # last loop frame (exclusive: frames 8-27)
-RUN_IDLE_SPEED = 2        # frames per tick during run→idle rewind
 
 # ── state machine ───────────────────────────────────────────
 class PetState:
@@ -213,7 +212,6 @@ class PetState:
         self.frame_idx = 0
         self._idle_dir = 1           # 1 = forward, -1 = backward
         self._pending_run = False    # fast-forward idle → curl → switch to run
-        self._pending_idle = False   # rewind run → curl → switch to idle
         self.lock = threading.Lock()
 
     def _aggregate_state(self) -> tuple[str | None, str | None]:
@@ -239,7 +237,7 @@ class PetState:
                         pass
                     continue
                 raw_state = data.get("state", "idle")
-                if raw_state in ("working", "complete"):
+                if raw_state == "working":
                     has_active = True
                 if raw_state == "complete" and ts > latest_ts:
                     msg = data.get("message", "").strip()
@@ -268,8 +266,12 @@ class PetState:
             if new_state == self.current:
                 return result_message
 
-            # Transition with smooth animation
             old = self.current
+
+            # Guard: don't interrupt an in-progress smooth transition
+            if self._pending_run and old == "idle":
+                return result_message  # fast-forward still in progress
+
             # idle → run while in stretched zone: fast-forward to curl first
             if old == "idle" and new_state == "run" and self.frame_idx < IDLE_CURLED_START:
                 self._pending_run = True
@@ -277,18 +279,12 @@ class PetState:
                 print(f"[pet] idle → run (fast-forward)", flush=True)
                 return result_message
 
-            # run → idle while in running loop: rewind to curled pose first
-            if old == "run" and new_state == "idle" and self.frame_idx >= RUN_LOOP_START:
-                self._pending_idle = True
-                print(f"[pet] run → idle (rewind)", flush=True)
-                return result_message
-
-            # Direct transition (already in curled zone or settle phase)
+            # run → idle: direct switch
+            # Direct transition
             self.current = new_state
             self.frame_idx = 0
             self._idle_dir = 1
             self._pending_run = False
-            self._pending_idle = False
             print(f"[pet] {old} → {new_state}", flush=True)
             return result_message
 
@@ -302,25 +298,10 @@ class PetState:
                 return self._tick_run()
 
     def _tick_run(self) -> Image.Image | None:
-        """Run: play 0→7 settle once, then loop 8→27.
-        If _pending_idle: rewind to frame 0 then switch to idle curled."""
+        """Run: play 0→7 settle once, then loop 8→27."""
         frames = FRAMES.get("run")
         if not frames:
             return None
-
-        # Rewind: run → idle transition
-        if self._pending_idle:
-            self.frame_idx -= RUN_IDLE_SPEED
-            if self.frame_idx <= 0:
-                self.frame_idx = 0
-                self.current = "idle"
-                self.frame_idx = IDLE_CURLED_START
-                self._idle_dir = 1
-                self._pending_idle = False
-                print("[pet] rewind done → idle", flush=True)
-                idle_frames = FRAMES.get("idle")
-                return idle_frames[IDLE_CURLED_START] if idle_frames else frames[0]
-            return frames[self.frame_idx]
 
         # Normal run animation
         frame = frames[self.frame_idx]
