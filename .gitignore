@@ -6,3 +6,5 @@ vid/
 *autosave*
 .python-version
 .venv/
+PLAN.md
+TODO.md
