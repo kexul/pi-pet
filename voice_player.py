@@ -116,7 +116,24 @@ class VoicePlayer:
 
 
 def _strip_markdown(text: str) -> str:
-    """Remove common markdown formatting so TTS reads naturally."""
+    """Remove common markdown formatting and emoji so TTS reads naturally."""
+    # Emoji — covers most Unicode emoji ranges
+    text = re.sub(
+        r'[\U0001F600-\U0001F64F'   # emoticons
+        r'\U0001F300-\U0001F5FF'     # misc symbols & pictographs
+        r'\U0001F680-\U0001F6FF'     # transport & map
+        r'\U0001F1E0-\U0001F1FF'     # flags
+        r'\U00002600-\U000026FF'     # misc symbols
+        r'\U00002700-\U000027BF'     # dingbats
+        r'\U0000FE00-\U0000FE0F'     # variation selectors
+        r'\U0001F900-\U0001F9FF'     # supplemental symbols
+        r'\U0001FA00-\U0001FA6F'     # chess symbols
+        r'\U0001FA70-\U0001FAFF'     # symbols extended-A
+        r'\U00002300-\U000023FF'     # misc technical
+        r'\U00002B50'                 # ⭐
+        r'\U00002764'                 # ❤
+        r'\U0000200D'                 # ZWJ
+        r']+', '', text)
     text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
     text = re.sub(r'\[([^\]]*)\]\([^\)]*\)', r'\1', text)
     text = re.sub(r'\*\*\*([^*]+)\*\*\*', r'\1', text)
