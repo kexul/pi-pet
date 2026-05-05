@@ -9,14 +9,17 @@ import ctypes
 import ctypes.wintypes as wintypes
 import json
 import os
+import re
 import sys
 import time
 import threading
 from pathlib import Path
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 import tkinter as tk
 import pystray
+
+from voice_player import VoicePlayer
 
 # ── config ──────────────────────────────────────────────────
 ASSETS_DIR = Path(__file__).parent / "assets"
@@ -200,6 +203,7 @@ FRAMES = {
 # fast-forward to curled zone first for a smoother transition.
 IDLE_CURLED_START = 38   # first frame where cat is fully curled
 IDLE_FAST_SPEED = 5       # frames per tick during fast-forward
+IDLE_CURL_HOLD_TICKS = 1440  # stay curled for 60s @ 24fps before uncurling
 
 # Run animation: 0-7 settle (curl→run), 8-27 loop (running cycles)
 RUN_LOOP_START = 8        # first loop frame
@@ -212,6 +216,7 @@ class PetState:
         self.frame_idx = 0
         self._idle_dir = 1           # 1 = forward, -1 = backward
         self._pending_run = False    # fast-forward idle → curl → switch to run
+        self._curl_hold = 0            # ticks remaining at curled end before reversing
         self.lock = threading.Lock()
 
     def _aggregate_state(self) -> tuple[str | None, str | None]:
@@ -339,8 +344,13 @@ class PetState:
         frame = frames[self.frame_idx]
         self.frame_idx += self._idle_dir
         if self.frame_idx >= n:
-            self.frame_idx = n - 2
-            self._idle_dir = -1
+            if self._curl_hold < IDLE_CURL_HOLD_TICKS:
+                self._curl_hold += 1
+                self.frame_idx = n - 1  # stay at curled end
+            else:
+                self._curl_hold = 0
+                self.frame_idx = n - 2
+                self._idle_dir = -1
         elif self.frame_idx < 0:
             self.frame_idx = 1
             self._idle_dir = 1
@@ -358,61 +368,77 @@ class PetState:
 
 # ── speech bubble ──────────────────────────────────────────
 class SpeechBubble:
-    """A simple fixed-size speech bubble above the pet."""
+    """A comic-style speech bubble rendered with PIL — rounded
+    corners, tail pointing to the pet, drop shadow, and fade-in."""
 
-    BUBBLE_BG = "#FFF8DC"
-    BUBBLE_FG = "#333333"
-    FONT = ("Microsoft YaHei", 11)
-    DISMISS_MS = 4000
+    BUBBLE_FILL = (255, 250, 240, 255)   # warm floral white
+    TEXT_COLOR  = (80, 60, 40, 255)      # dark brown
+    SHADOW_COLOR = (190, 185, 175, 255)  # solid warm grey (no alpha → no magenta bleed)
+    FONT_SIZE   = 13
+    DISMISS_MS  = 5000
+    FADE_MS     = 18                     # ms per fade step
+    FADE_STEPS  = 12
+    CORNER_R    = 14                     # corner radius
+    TAIL_W      = 18                     # tail width at base
+    TAIL_H      = 10                     # tail height
+    PAD_X       = 24
+    PAD_Y       = 16
+    MAX_CHARS   = 10                     # one line, 10 chars max
 
     def __init__(self):
         self._window: tk.Toplevel | None = None
         self._dismiss_id: str | None = None
+        self._fade_id: str | None = None
         self._last_message: str | None = None
+        self._fade_step = 0
 
-    def show(self, message: str, anchor_x: int, anchor_y: int, anchor_size: int):
-        """Show a simple completion notification."""
+    # ── public API ──────────────────────────────────────
+    def show(self, message: str, anchor_x: int, anchor_y: int,
+             anchor_size: int):
         if message == self._last_message:
             return
         self._last_message = message
         self.dismiss()
 
-        # Just a brief notification, not the full message
-        text = "\u2714 pi \u5b8c\u6210\u5566!"  # ✓ pi 完成啦!
+        text = self._prepare_text(message)
+        img = self._render_bubble(text)
 
         self._window = tk.Toplevel()
         self._window.overrideredirect(True)
         self._window.attributes("-topmost", True)
-        self._window.configure(bg=self.BUBBLE_BG)
+        self._window.attributes("-alpha", 0.0)          # start invisible
+        self._window.configure(bg=COLOR_KEY)
+        self._window.wm_attributes("-transparentcolor", COLOR_KEY)
 
-        hwnd = self._window.winfo_id()
+        self._tk_img = ImageTk.PhotoImage(img)
+        label = tk.Label(self._window, image=self._tk_img,
+                         bg=COLOR_KEY, bd=0)
+        label.pack()
+
+        # Position above the pet, keep on-screen
+        x = anchor_x + (anchor_size - img.width) // 2
+        y = anchor_y - img.height - 8
+        sw = self._window.winfo_screenwidth()
+        sh = self._window.winfo_screenheight()
+        x = max(8, min(x, sw - img.width - 8))
+        if y < 8:
+            y = anchor_y + anchor_size + 8
+
+        self._window.geometry(f"+{x}+{y}")
+
+        # Win32 extended styles (no taskbar entry, no focus steal)
         self._window.update_idletasks()
+        hwnd = self._window.winfo_id()
         style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
         style |= WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
         user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
 
-        label = tk.Label(
-            self._window, text=text, bg=self.BUBBLE_BG, fg=self.BUBBLE_FG,
-            font=(self.FONT[0], self.FONT[1], "bold"),
-            padx=20, pady=12,
-        )
-        label.pack()
-
-        x = anchor_x + (anchor_size - 160) // 2
-        y = anchor_y - 50 - 12
-        sw = self._window.winfo_screenwidth()
-        sh = self._window.winfo_screenheight()
-        if x < 8:
-            x = 8
-        if y < 8:
-            y = anchor_y + anchor_size + 12
-
-        self._window.geometry(f"+{x}+{y}")
-        self._dismiss_id = self._window.after(self.DISMISS_MS, self.dismiss)
-        print(f"[pet] Bubble: done", flush=True)
+        self._start_fade_in()
+        self._dismiss_id = self._window.after(self.DISMISS_MS,
+                                               self.dismiss)
+        print("[pet] Bubble shown", flush=True)
 
     def dismiss(self):
-        """Close the speech bubble."""
         if self._window is not None:
             try:
                 self._window.destroy()
@@ -420,7 +446,101 @@ class SpeechBubble:
                 pass
             self._window = None
             self._dismiss_id = None
+            self._fade_id = None
             print("[pet] Bubble dismissed", flush=True)
+
+    # ── helpers ─────────────────────────────────────────
+    def _prepare_text(self, message: str) -> str:
+        msg = message.strip()
+        if not msg:
+            return "\u2714 \u5b8c\u6210\u5566!"  # ✓ 完成啦!
+        # Take first line only, truncate to MAX_CHARS
+        msg = msg.splitlines()[0].strip()
+        if len(msg) > self.MAX_CHARS:
+            msg = msg[:self.MAX_CHARS - 1] + "\u2026"  # …
+        return msg
+
+    def _start_fade_in(self):
+        self._fade_step = 0
+        self._do_fade_step()
+
+    def _do_fade_step(self):
+        if self._window is None:
+            return
+        self._fade_step += 1
+        alpha = self._fade_step / self.FADE_STEPS
+        try:
+            self._window.attributes("-alpha", alpha)
+        except Exception:
+            return
+        if self._fade_step < self.FADE_STEPS:
+            self._fade_id = self._window.after(self.FADE_MS,
+                                                self._do_fade_step)
+
+    # ── PIL rendering ───────────────────────────────────
+    def _render_bubble(self, text: str) -> Image.Image:
+        """Draw the speech bubble to a PIL RGBA image."""
+        font = self._load_font()
+
+        # Measure text
+        dummy = Image.new("RGBA", (1, 1))
+        draw = ImageDraw.Draw(dummy)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+
+        r  = self.CORNER_R
+        shadow   = 3
+        bw = tw + self.PAD_X * 2
+        bh = th + self.PAD_Y * 2
+        img_w = bw + shadow
+        img_h = bh + shadow
+
+        img = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # 1) drop shadow
+        sr = (shadow, shadow, bw + shadow, bh + shadow)
+        self._draw_rounded_rect(draw, sr, r, self.SHADOW_COLOR)
+
+        # 2) bubble body
+        self._draw_rounded_rect(draw, (0, 0, bw, bh), r,
+                                self.BUBBLE_FILL)
+
+        # 3) text
+        tx = (bw - tw) // 2
+        ty = (bh - th) // 2
+        draw.text((tx, ty), text, fill=self.TEXT_COLOR, font=font)
+
+        return img
+
+    @staticmethod
+    def _draw_rounded_rect(draw, bbox, r, fill):
+        """Filled rounded rectangle via centre rect + 4 corner arcs."""
+        x0, y0, x1, y1 = bbox
+        d = r * 2
+        # centre strips
+        draw.rectangle((x0 + r, y0, x1 - r, y1), fill=fill)
+        draw.rectangle((x0, y0 + r, x1, y1 - r), fill=fill)
+        # four quarter-circles
+        draw.pieslice((x0, y0, x0 + d, y0 + d), 180, 270, fill=fill)
+        draw.pieslice((x1 - d, y0, x1, y0 + d), 270, 360, fill=fill)
+        draw.pieslice((x0, y1 - d, x0 + d, y1), 90, 180, fill=fill)
+        draw.pieslice((x1 - d, y1 - d, x1, y1), 0, 90, fill=fill)
+
+    @staticmethod
+    def _load_font():
+        """Load a CJK-capable TrueType font, falling back to default."""
+        for path in [
+            "C:/Windows/Fonts/msyh.ttc",
+            "C:/Windows/Fonts/msyhbd.ttc",
+            "C:/Windows/Fonts/simhei.ttf",
+        ]:
+            try:
+                return ImageFont.truetype(path, SpeechBubble.FONT_SIZE)
+            except (OSError, IOError):
+                continue
+        return ImageFont.load_default()
 
 
 # ── floating pet window ─────────────────────────────────────
@@ -437,6 +557,7 @@ class FloatingPet:
         self._drag_win_y = 0
         self._drag_moved = False
         self.bubble = SpeechBubble()
+        self.voice_player = VoicePlayer()
 
         # Create tkinter window
         self.root = tk.Tk()
@@ -588,9 +709,11 @@ class FloatingPet:
         message = self.state.update_from_file()
         # Show speech bubble if there's a new complete message
         if message:
+            message = _strip_markdown(message)
             x = self.root.winfo_x()
             y = self.root.winfo_y()
             self.bubble.show(message, x, y, WIN_SIZE)
+            self.voice_player.speak(message)
         self.root.after(POLL_INTERVAL_MS, self._poll_status)
 
     def _animate(self):
@@ -647,6 +770,36 @@ class PetApp:
 
         self.floating.start()
         print("[pet] Goodbye!", flush=True)
+
+
+def _strip_markdown(text: str) -> str:
+    """Remove common markdown formatting so TTS / bubble reads naturally."""
+    # images
+    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
+    # links → keep text only
+    text = re.sub(r'\[([^\]]*)\]\([^\)]*\)', r'\1', text)
+    # bold + italic
+    text = re.sub(r'\*\*\*([^*]+)\*\*\*', r'\1', text)
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    text = re.sub(r'__([^_]+)__', r'\1', text)
+    text = re.sub(r'\*([^*]+)\*', r'\1', text)
+    text = re.sub(r'_([^_]+)_', r'\1', text)
+    # inline code
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    # code blocks
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    # strikethrough
+    text = re.sub(r'~~([^~]+)~~', r'\1', text)
+    # headings
+    text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)
+    # list markers
+    text = re.sub(r'^[\s]*[-*+]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^[\s]*\d+\.\s+', '', text, flags=re.MULTILINE)
+    # horizontal rules
+    text = re.sub(r'^[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
+    # collapse whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
 def main():
