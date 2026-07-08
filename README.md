@@ -1,10 +1,10 @@
 # pi-pet 🐱
 
-Desktop cat pet that reacts to [pi](https://pi.dev) coding agent state changes.
+Animated system tray cat that reacts to [pi](https://pi.dev) coding agent state changes.
 
 - **idle** — stretches and curls
 - **working** — runs when pi is processing
-- **complete** — pops up "✓ pi 完成啦!" bubble
+- **complete** — speaks the message
 
 ## Setup
 

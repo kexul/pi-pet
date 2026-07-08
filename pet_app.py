@@ -1,12 +1,9 @@
 """
-Desktop Pet - Floating window cat + system tray icon.
+Tray Pet - Animated system tray cat.
 Reacts to pi agent state changes from the pi extension.
 
-Floating window: 128x128, always-on-top, magenta-key transparency, click-through by default.
-System tray: static icon for right-click menu (Move Pet / Exit).
+System tray: animated cat icon with right-click menu (Exit).
 """
-import ctypes
-import ctypes.wintypes as wintypes
 import json
 import os
 import re
@@ -15,8 +12,7 @@ import time
 import threading
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageTk
-import tkinter as tk
+from PIL import Image, ImageDraw
 import pystray
 
 from voice_player import VoicePlayer
@@ -25,38 +21,14 @@ from voice_player import VoicePlayer
 ASSETS_DIR = Path(__file__).parent / "assets"
 STATUS_DIR = Path(os.environ.get("TEMP", "/tmp")) / "pi-pet"
 STALE_TTL = 60.0  # seconds before a status file is considered stale
-PID_CHECK_INTERVAL = 5.0  # seconds between PID liveness checks
-POSITION_FILE = Path(os.environ.get("TEMP", "/tmp")) / "pi-pet-position.json"
 POLL_INTERVAL_MS = 100         # status file poll (milliseconds)
 ANIM_FPS = 24                  # animation frame rate (matches source video)
-WIN_SIZE = 128                 # floating window size (pixels)
-COLOR_KEY = "#FF00FF"          # magenta = transparent
-
-# ── Win32 helpers (click-through only) ──────────────────────
-GWL_EXSTYLE = -20
-WS_EX_TRANSPARENT = 0x00000020
-WS_EX_TOOLWINDOW = 0x00000080
-WS_EX_NOACTIVATE = 0x08000000
-SWP_NOMOVE = 0x0002
-SWP_NOSIZE = 0x0001
-SWP_NOZORDER = 0x0004
-SWP_FRAMECHANGED = 0x0020
-
-user32 = ctypes.windll.user32
-
-
-def _set_click_through(hwnd: int, enable: bool):
-    """Toggle WS_EX_TRANSPARENT on a window (mouse pass-through)."""
-    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-    if enable:
-        style |= WS_EX_TRANSPARENT
-    else:
-        style &= ~WS_EX_TRANSPARENT
-    user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-    user32.SetWindowPos(
-        wintypes.HWND(hwnd), 0, 0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-    )
+TRAY_ICON_SIZE = 64            # icon image size passed to pystray
+TRAY_TIP_MAX_CHARS = 127       # Windows tray tooltip limit
+TRAY_NOTIFY_MAX_CHARS = 255    # Windows notification body limit
+TRAY_TITLE_MAX_CHARS = 63      # Windows notification title limit
+TTS_MAX_CHARS = 40             # keep spoken completion messages short
+TRAY_FRAME_CACHE = {}          # id(PIL frame) -> prepared tray icon
 
 
 # ── load frames ─────────────────────────────────────────────
@@ -85,7 +57,21 @@ def _magenta_to_transparent(img: Image.Image) -> Image.Image:
     return img
 
 
-def _draw_tray_icon(size: int = 64) -> Image.Image:
+def _prepare_tray_frame(img: Image.Image, size: int = TRAY_ICON_SIZE) -> Image.Image:
+    """Convert an animation frame into a transparent tray icon."""
+    img = _magenta_to_transparent(img)
+    bbox = img.getbbox()
+    if bbox:
+        img = img.crop(bbox)
+    img.thumbnail((size, size), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    x = (size - img.width) // 2
+    y = (size - img.height) // 2
+    canvas.alpha_composite(img, (x, y))
+    return canvas
+
+
+def _draw_tray_icon(size: int = TRAY_ICON_SIZE) -> Image.Image:
     """Draw a simple cat icon for the system tray using PIL ImageDraw.
 
     The icon is a cat face with ears, eyes, nose, and whiskers on a
@@ -259,7 +245,7 @@ class PetState:
         return "idle", latest_message
 
     def update_from_file(self) -> str | None:
-        """Scan status files, update state. Returns message for speech bubble."""
+        """Scan status files, update state. Returns message for notification."""
         new_state, new_message = self._aggregate_state()
         with self.lock:
             # Check for new message (even if state unchanged)
@@ -366,414 +352,103 @@ class PetState:
             return None
 
 
-# ── speech bubble ──────────────────────────────────────────
-class SpeechBubble:
-    """A comic-style speech bubble rendered with PIL — rounded
-    corners, tail pointing to the pet, drop shadow, and fade-in."""
-
-    BUBBLE_FILL = (255, 250, 240, 255)   # warm floral white
-    TEXT_COLOR  = (80, 60, 40, 255)      # dark brown
-    SHADOW_COLOR = (190, 185, 175, 255)  # solid warm grey (no alpha → no magenta bleed)
-    FONT_SIZE   = 13
-    DISMISS_MS  = 5000
-    FADE_MS     = 18                     # ms per fade step
-    FADE_STEPS  = 12
-    CORNER_R    = 14                     # corner radius
-    TAIL_W      = 18                     # tail width at base
-    TAIL_H      = 10                     # tail height
-    PAD_X       = 24
-    PAD_Y       = 16
-    MAX_CHARS   = 10                     # one line, 10 chars max
-
-    def __init__(self):
-        self._window: tk.Toplevel | None = None
-        self._dismiss_id: str | None = None
-        self._fade_id: str | None = None
-        self._last_message: str | None = None
-        self._fade_step = 0
-
-    # ── public API ──────────────────────────────────────
-    def show(self, message: str, anchor_x: int, anchor_y: int,
-             anchor_size: int):
-        if message == self._last_message:
-            return
-        self._last_message = message
-        self.dismiss()
-
-        text = self._prepare_text(message)
-        img = self._render_bubble(text)
-
-        self._window = tk.Toplevel()
-        self._window.overrideredirect(True)
-        self._window.attributes("-topmost", True)
-        self._window.attributes("-alpha", 0.0)          # start invisible
-        self._window.configure(bg=COLOR_KEY)
-        self._window.wm_attributes("-transparentcolor", COLOR_KEY)
-
-        self._tk_img = ImageTk.PhotoImage(img)
-        label = tk.Label(self._window, image=self._tk_img,
-                         bg=COLOR_KEY, bd=0)
-        label.pack()
-
-        # Position above the pet, keep on-screen
-        x = anchor_x + (anchor_size - img.width) // 2
-        y = anchor_y - img.height - 8
-        sw = self._window.winfo_screenwidth()
-        sh = self._window.winfo_screenheight()
-        x = max(8, min(x, sw - img.width - 8))
-        if y < 8:
-            y = anchor_y + anchor_size + 8
-
-        self._window.geometry(f"+{x}+{y}")
-
-        # Win32 extended styles (no taskbar entry, no focus steal)
-        self._window.update_idletasks()
-        hwnd = self._window.winfo_id()
-        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        style |= WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-
-        self._start_fade_in()
-        self._dismiss_id = self._window.after(self.DISMISS_MS,
-                                               self.dismiss)
-        print("[pet] Bubble shown", flush=True)
-
-    def dismiss(self):
-        if self._window is not None:
-            try:
-                self._window.destroy()
-            except Exception:
-                pass
-            self._window = None
-            self._dismiss_id = None
-            self._fade_id = None
-            print("[pet] Bubble dismissed", flush=True)
-
-    # ── helpers ─────────────────────────────────────────
-    def _prepare_text(self, message: str) -> str:
-        msg = message.strip()
-        if not msg:
-            return "\u2714 \u5b8c\u6210\u5566!"  # ✓ 完成啦!
-        # Take first line only, truncate to MAX_CHARS
-        msg = msg.splitlines()[0].strip()
-        if len(msg) > self.MAX_CHARS:
-            msg = msg[:self.MAX_CHARS - 1] + "\u2026"  # …
-        return msg
-
-    def _start_fade_in(self):
-        self._fade_step = 0
-        self._do_fade_step()
-
-    def _do_fade_step(self):
-        if self._window is None:
-            return
-        self._fade_step += 1
-        alpha = self._fade_step / self.FADE_STEPS
-        try:
-            self._window.attributes("-alpha", alpha)
-        except Exception:
-            return
-        if self._fade_step < self.FADE_STEPS:
-            self._fade_id = self._window.after(self.FADE_MS,
-                                                self._do_fade_step)
-
-    # ── PIL rendering ───────────────────────────────────
-    def _render_bubble(self, text: str) -> Image.Image:
-        """Draw the speech bubble to a PIL RGBA image."""
-        font = self._load_font()
-
-        # Measure text
-        dummy = Image.new("RGBA", (1, 1))
-        draw = ImageDraw.Draw(dummy)
-        bbox = draw.textbbox((0, 0), text, font=font)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-
-        r  = self.CORNER_R
-        shadow   = 3
-        bw = tw + self.PAD_X * 2
-        bh = th + self.PAD_Y * 2
-        img_w = bw + shadow
-        img_h = bh + shadow
-
-        img = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-
-        # 1) drop shadow
-        sr = (shadow, shadow, bw + shadow, bh + shadow)
-        self._draw_rounded_rect(draw, sr, r, self.SHADOW_COLOR)
-
-        # 2) bubble body
-        self._draw_rounded_rect(draw, (0, 0, bw, bh), r,
-                                self.BUBBLE_FILL)
-
-        # 3) text
-        tx = (bw - tw) // 2
-        ty = (bh - th) // 2
-        draw.text((tx, ty), text, fill=self.TEXT_COLOR, font=font)
-
-        return img
-
-    @staticmethod
-    def _draw_rounded_rect(draw, bbox, r, fill):
-        """Filled rounded rectangle via centre rect + 4 corner arcs."""
-        x0, y0, x1, y1 = bbox
-        d = r * 2
-        # centre strips
-        draw.rectangle((x0 + r, y0, x1 - r, y1), fill=fill)
-        draw.rectangle((x0, y0 + r, x1, y1 - r), fill=fill)
-        # four quarter-circles
-        draw.pieslice((x0, y0, x0 + d, y0 + d), 180, 270, fill=fill)
-        draw.pieslice((x1 - d, y0, x1, y0 + d), 270, 360, fill=fill)
-        draw.pieslice((x0, y1 - d, x0 + d, y1), 90, 180, fill=fill)
-        draw.pieslice((x1 - d, y1 - d, x1, y1), 0, 90, fill=fill)
-
-    @staticmethod
-    def _load_font():
-        """Load a CJK-capable TrueType font, falling back to default."""
-        for path in [
-            "C:/Windows/Fonts/msyh.ttc",
-            "C:/Windows/Fonts/msyhbd.ttc",
-            "C:/Windows/Fonts/simhei.ttf",
-        ]:
-            try:
-                return ImageFont.truetype(path, SpeechBubble.FONT_SIZE)
-            except (OSError, IOError):
-                continue
-        return ImageFont.load_default()
-
-
-# ── floating pet window ─────────────────────────────────────
-class FloatingPet:
-    """A borderless, always-on-top window with magenta-key transparency."""
-
-    def __init__(self, state: PetState):
-        self.state = state
-        self._interactive_until = 0.0
-        self._dragging = False
-        self._drag_start_x = 0
-        self._drag_start_y = 0
-        self._drag_win_x = 0
-        self._drag_win_y = 0
-        self._drag_moved = False
-        self.bubble = SpeechBubble()
-        self.voice_player = VoicePlayer()
-
-        # Create tkinter window
-        self.root = tk.Tk()
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        self.root.configure(bg=COLOR_KEY)
-        self.root.wm_attributes("-transparentcolor", COLOR_KEY)
-
-        # Load position
-        x, y = self._load_position()
-        self.root.geometry(f"{WIN_SIZE}x{WIN_SIZE}+{x}+{y}")
-
-        # Force window realization
-        self.root.update_idletasks()
-        self.hwnd = self.root.winfo_id()
-
-        # Set extended styles: tool window (no taskbar) + no activate
-        style = user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
-        style |= WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-        user32.SetWindowLongW(self.hwnd, GWL_EXSTYLE, style)
-        user32.SetWindowPos(
-            wintypes.HWND(self.hwnd), 0, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-        )
-
-        # Default: click-through
-        _set_click_through(self.hwnd, True)
-        print(f"[pet] Click-through enabled", flush=True)
-
-        # Label that shows the cat frame
-        self._label = tk.Label(
-            self.root, bg=COLOR_KEY, bd=0, highlightthickness=0,
-        )
-        self._label.pack(fill=tk.BOTH, expand=True)
-
-        # Show initial frame
-        self._show_frame(self.state.get_current_frame())
-
-        # Mouse bindings (only active when click-through is off)
-        self._label.bind("<Button-1>", self._on_mouse_down)
-        self._label.bind("<B1-Motion>", self._on_mouse_move)
-        self._label.bind("<ButtonRelease-1>", self._on_mouse_up)
-
-        print(f"[pet] Window ready at ({x},{y})", flush=True)
-
-    def _show_frame(self, pil_image: Image.Image | None):
-        """Display a frame on the label."""
-        if pil_image is None:
-            return
-        # Use PhotoImage from cache or convert on-the-fly
-        tk_img = ImageTk.PhotoImage(pil_image)
-        self._label.configure(image=tk_img)
-        self._label.image = tk_img  # prevent GC
-
-    # ── position persistence ────────────────────────────
-    def _load_position(self) -> tuple[int, int]:
-        try:
-            if POSITION_FILE.exists():
-                data = json.loads(POSITION_FILE.read_text())
-                return data["x"], data["y"]
-        except (json.JSONDecodeError, OSError, KeyError):
-            pass
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        return sw - WIN_SIZE - 16, sh - WIN_SIZE - 80
-
-    def _save_position(self):
-        try:
-            POSITION_FILE.write_text(json.dumps({
-                "x": self.root.winfo_x(),
-                "y": self.root.winfo_y(),
-            }))
-        except OSError:
-            pass
-
-    # ── interactivity ───────────────────────────────────
-    def enable_interactive(self):
-        """Temporarily disable click-through for dragging / clicking."""
-        _set_click_through(self.hwnd, False)
-        self._interactive_until = time.time() + 3.0
-        self.root.after(3000, self._check_interactive_timeout)
-        print("[pet] Interactive mode ON (3s)", flush=True)
-
-    def _check_interactive_timeout(self):
-        if time.time() >= self._interactive_until and not self._dragging:
-            _set_click_through(self.hwnd, True)
-            print("[pet] Interactive mode OFF", flush=True)
-
-    def _reset_interactive_timer(self):
-        self._interactive_until = time.time() + 3.0
-
-    # ── drag handling ───────────────────────────────────
-    def _on_mouse_down(self, event):
-        self._dragging = True
-        self._drag_moved = False
-        self._drag_start_x = event.x_root
-        self._drag_start_y = event.y_root
-        self._drag_win_x = self.root.winfo_x()
-        self._drag_win_y = self.root.winfo_y()
-
-    def _on_mouse_move(self, event):
-        if not self._dragging:
-            return
-        dx = event.x_root - self._drag_start_x
-        dy = event.y_root - self._drag_start_y
-        if abs(dx) > 2 or abs(dy) > 2:
-            self._drag_moved = True
-        new_x = self._drag_win_x + dx
-        new_y = self._drag_win_y + dy
-        self.root.geometry(f"+{new_x}+{new_y}")
-
-    def _on_mouse_up(self, event):
-        if self._dragging:
-            self._dragging = False
-            if self._drag_moved:
-                self._save_position()
-                self._reset_interactive_timer()
-            else:
-                self._on_click_feedback()
-                self._reset_interactive_timer()
-
-    def _on_click_feedback(self):
-        """Brief bounce reaction when clicked."""
-        orig_x = self.root.winfo_x()
-        orig_y = self.root.winfo_y()
-
-        def _bounce(step):
-            offsets = [0, -8, 0, -4, 0]
-            if step >= len(offsets):
-                return
-            self.root.geometry(f"+{orig_x}+{orig_y + offsets[step]}")
-            self.root.after(40, lambda: _bounce(step + 1))
-
-        _bounce(0)
-
-    # ── main loop ───────────────────────────────────────
-    def start(self):
-        self._poll_status()
-        self._animate()
-        self.root.mainloop()
-
-    def stop(self):
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
-
-    def _poll_status(self):
-        message = self.state.update_from_file()
-        # Show speech bubble if there's a new complete message
-        if message:
-            message = _strip_markdown(message)
-            x = self.root.winfo_x()
-            y = self.root.winfo_y()
-            self.bubble.show(message, x, y, WIN_SIZE)
-            self.voice_player.speak(message)
-        self.root.after(POLL_INTERVAL_MS, self._poll_status)
-
-    def _animate(self):
-        frame = self.state.tick()
-        if frame:
-            self._show_frame(frame)
-        self.root.after(int(1000 / ANIM_FPS), self._animate)
-
-
 # ── application ─────────────────────────────────────────────
 class PetApp:
     def __init__(self):
         self.state = PetState()
-        self.floating = FloatingPet(self.state)
         self.icon = None
-
-    def _on_move(self, icon, item):
-        self.floating.root.after(0, self.floating.enable_interactive)
+        self.voice_player = VoicePlayer()
+        self._running = False
+        self._last_tooltip = "pi pet cat"
 
     def _on_quit(self, icon, item):
+        self._running = False
+        self.voice_player.stop()
         icon.stop()
-        self.floating.root.after(0, self.floating.stop)
+
+    def _tray_setup(self, icon):
+        icon.visible = True
+        next_poll = 0.0
+        while self._running:
+            now = time.monotonic()
+            if now >= next_poll:
+                self._poll_status()
+                next_poll = now + POLL_INTERVAL_MS / 1000
+            self._animate_tray_icon()
+            time.sleep(1 / ANIM_FPS)
+
+    def _poll_status(self):
+        message = self.state.update_from_file()
+        if not message:
+            return
+        message = _strip_markdown(message)
+        self.voice_player.speak(_tts_summary(message))
+
+    def _show_complete_notification(self, message: str):
+        title = _truncate_text("pi 完成啦", TRAY_TITLE_MAX_CHARS)
+        body = _truncate_text(message, TRAY_NOTIFY_MAX_CHARS)
+        tooltip = _truncate_text(f"{title}: {body}", TRAY_TIP_MAX_CHARS)
+        self._last_tooltip = tooltip
+        if self.icon is None:
+            return
+        self.icon.title = tooltip
+        try:
+            self.icon.notify(body, title)
+        except NotImplementedError:
+            pass
+
+    def _animate_tray_icon(self):
+        frame = self.state.tick()
+        if frame is None or self.icon is None:
+            return
+        key = id(frame)
+        tray_frame = TRAY_FRAME_CACHE.get(key)
+        if tray_frame is None:
+            tray_frame = _prepare_tray_frame(frame)
+            TRAY_FRAME_CACHE[key] = tray_frame
+        self.icon.icon = tray_frame
 
     def _run_tray(self):
-        initial_frame = FRAMES["idle"][0] if FRAMES["idle"] else None
-        if not initial_frame:
-            print("ERROR: no tray icon")
-            return
+        initial_frame = self.state.get_current_frame()
+        if initial_frame:
+            tray_icon_img = _prepare_tray_frame(initial_frame)
+        else:
+            tray_icon_img = _draw_tray_icon()
 
-        # Draw a dedicated cat icon for tray visibility
-        tray_icon_img = _draw_tray_icon()
-
-        menu = pystray.Menu(
-            pystray.MenuItem("Move Pet", self._on_move),
-            pystray.MenuItem("Exit", self._on_quit),
-        )
+        menu = pystray.Menu(pystray.MenuItem("Exit", self._on_quit))
 
         self.icon = pystray.Icon(
             "pi-pet",
             tray_icon_img,
-            "pi pet cat",
+            self._last_tooltip,
             menu,
         )
-        self.icon.run()
+        self.icon.run(self._tray_setup)
 
     def run(self):
-        tray_thread = threading.Thread(target=self._run_tray, daemon=True)
-        tray_thread.start()
-
         print("[pet] Cat pet started!", flush=True)
-        print(f"[pet]   Floating window: {WIN_SIZE}x{WIN_SIZE}", flush=True)
-        print(f"[pet]   Tray icon: right-click for menu", flush=True)
+        print("[pet]   Tray icon: animated, right-click for menu", flush=True)
         print(f"[pet]   Watching: {STATUS_DIR}/status-*.json", flush=True)
-
-        self.floating.start()
+        self._running = True
+        self._run_tray()
         print("[pet] Goodbye!", flush=True)
 
 
+def _truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars - 1] + "…"
+
+
+def _tts_summary(text: str) -> str:
+    first_line = text.splitlines()[0].strip() if text.strip() else ""
+    if not first_line:
+        return "pi 完成啦"
+    return _truncate_text(first_line, TTS_MAX_CHARS)
+
+
 def _strip_markdown(text: str) -> str:
-    """Remove common markdown formatting so TTS / bubble reads naturally."""
+    """Remove common markdown formatting so TTS / notifications read naturally."""
     # images
     text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
     # links → keep text only
